@@ -1,0 +1,14 @@
+{
+  "name": "nate-poultry-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix frontend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": "cd backend && venv/bin/python main.py",
+    "dev": "npx concurrently -n \"backend,frontend\" -c \"cyan,green\" \"npm run dev:backend\" \"npm run dev:frontend\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
