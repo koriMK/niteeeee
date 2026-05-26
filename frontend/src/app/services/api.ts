@@ -72,12 +72,16 @@ export interface AuthResponse {
 }
 
 export async function checkPhone(phone: string): Promise<{ exists: boolean; phone: string; name: string | null }> {
-  return request('/api/auth/check-phone', { method: 'POST', body: JSON.stringify({ phone }) });
+  const safePhone = phone.replace(/[\r\n]/g, '');
+  return request('/api/auth/check-phone', { method: 'POST', body: JSON.stringify({ phone: safePhone }) });
 }
 
 export async function createAccount(phone: string, pin: string, name?: string): Promise<AuthResponse> {
+  const safePhone = phone.replace(/[\r\n]/g, '');
+  const safePin = pin.replace(/[\r\n]/g, '');
+  const safeName = name ? name.replace(/[\r\n]/g, '') : undefined;
   const data = await request<AuthResponse>('/api/auth/create-account', {
-    method: 'POST', body: JSON.stringify({ phone, pin, name }),
+    method: 'POST', body: JSON.stringify({ phone: safePhone, pin: safePin, name: safeName }),
   });
   setCookie('access_token', data.access_token);
   setCookie('refresh_token', data.refresh_token);
@@ -85,8 +89,10 @@ export async function createAccount(phone: string, pin: string, name?: string): 
 }
 
 export async function loginWithPin(phone: string, pin: string): Promise<AuthResponse> {
+  const safePhone = phone.replace(/[\r\n]/g, '');
+  const safePin = pin.replace(/[\r\n]/g, '');
   const data = await request<AuthResponse>('/api/auth/login', {
-    method: 'POST', body: JSON.stringify({ phone, pin }),
+    method: 'POST', body: JSON.stringify({ phone: safePhone, pin: safePin }),
   });
   setCookie('access_token', data.access_token);
   setCookie('refresh_token', data.refresh_token);
@@ -94,7 +100,8 @@ export async function loginWithPin(phone: string, pin: string): Promise<AuthResp
 }
 
 export async function forgotPin(phone: string): Promise<{ wa_link: string }> {
-  return request(`/api/auth/forgot-pin?phone=${encodeURIComponent(phone)}`);
+  const safePhone = phone.replace(/[\r\n]/g, '');
+  return request(`/api/auth/forgot-pin?phone=${encodeURIComponent(safePhone)}`);
 }
 
 export function isLoggedIn() { return !!getToken(); }

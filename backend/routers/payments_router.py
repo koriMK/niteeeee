@@ -21,6 +21,12 @@ from schemas import STKPushRequest, STKPushResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_log(msg: any) -> str:
+    """Sanitize dynamic parameters to prevent log injection (CWE-117)."""
+    return str(msg).replace("\r", "").replace("\n", "")
+
+
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 
 limiter = Limiter(key_func=get_remote_address)
@@ -116,6 +122,99 @@ def _assert_valid_safaricom_number(phone: str) -> None:
         )
 
 
+async def _verify_order_for_user(db: AsyncSession, order_id: int, user_id: int) -> Order:
+    """Verify that the order belongs to the user and is in a payable state."""
+    order_res = await db.execute(
+        select(Order).where(Order.id == order_id, Order.user_id == user_id)
+    )
+    order = order_res.scalar_one_or_none()
+    if order is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Order not found or does not belong to you.",
+        )
+    if order.status not in ("pending",):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Order is no longer in a payable state.",
+        )
+    return order
+
+
+def _generate_mpesa_password(timestamp: str) -> str:
+    """Generate Safaricom M-Pesa password: Base64(Shortcode + Passkey + Timestamp)."""
+    raw_str = f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}"
+    return base64.b64encode(raw_str.encode("utf-8")).decode("utf-8")
+
+
+async def _record_payment(
+    db: AsyncSession,
+    order_id: int | None,
+    phone: str,
+    amount: float,
+    checkout_request_id: str,
+    merchant_request_id: str,
+) -> Payment:
+    """Record payment in DB with status=pending."""
+    payment = Payment(
+        order_id=order_id,
+        phone=phone,
+        amount=amount,
+        checkout_request_id=checkout_request_id,
+        merchant_request_id=merchant_request_id,
+        status="pending",
+    )
+    db.add(payment)
+    await db.commit()
+    return payment
+
+
+def _build_stk_payload(
+    formatted_phone: str, password: str, timestamp: str, amount: int, order_id: int | None
+) -> dict:
+    return {
+        "BusinessShortCode": settings.MPESA_SHORTCODE,
+        "Password": password,
+        "Timestamp": timestamp,
+        "TransactionType": "CustomerPayBillOnline",
+        "Amount": amount,
+        "PartyA": formatted_phone,
+        "PartyB": settings.MPESA_SHORTCODE,
+        "PhoneNumber": formatted_phone,
+        "CallBackURL": settings.MPESA_CALLBACK_URL,
+        "AccountReference": f"Order-{order_id}" if order_id else "NatePoultry",
+        "TransactionDesc": f"Nate Poultry Order {order_id}" if order_id else "Nate Poultry Payment",
+    }
+
+
+async def _send_stk_push(token: str, payload: dict) -> dict:
+    url = f"{settings.mpesa_base_url}/mpesa/stkpush/v1/processrequest"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    logger.info("Sending STK Push to Safaricom")
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers, timeout=15.0)
+    if response.status_code != 200:
+        logger.error("Safaricom STK Push HTTP error")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Safaricom STK Push failed: {response.status_code}",
+        )
+    return response.json()
+
+
+def _check_safaricom_ip(request: Request) -> None:
+    """Raise 403 if request does not come from a known Safaricom IP (production only)."""
+    if settings.MPESA_ENV != "production":
+        return
+    client_ip = request.client.host if request.client else ""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip()
+    if client_ip not in SAFARICOM_IPS:
+        logger.warning("Callback rejected from unauthorised IP")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+
 # ── STK Push ──────────────────────────────────────────────────────────────────
 
 @router.post("/stk-push", response_model=STKPushResponse)
@@ -136,20 +235,7 @@ async def initiate_stk_push(
 
     # Verify the order belongs to the authenticated user
     if body.order_id is not None:
-        order_res = await db.execute(
-            select(Order).where(Order.id == body.order_id, Order.user_id == user.id)
-        )
-        order = order_res.scalar_one_or_none()
-        if order is None:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Order not found or does not belong to you.",
-            )
-        if order.status not in ("pending",):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Order is no longer in a payable state.",
-            )
+        await _verify_order_for_user(db, body.order_id, user.id)
 
     token = await get_mpesa_access_token()
 
@@ -157,65 +243,45 @@ async def initiate_stk_push(
     nairobi_time = datetime.now(timezone(timedelta(hours=3)))
     timestamp = nairobi_time.strftime("%Y%m%d%H%M%S")
 
-    # Generate password: Base64(Shortcode + Passkey + Timestamp)
-    password = base64.b64encode(
-        f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}".encode("utf-8")
-    ).decode("utf-8")
+    # Generate password
+    password = _generate_mpesa_password(timestamp)
 
     amount = max(1, int(round(body.amount)))
 
-    url = f"{settings.mpesa_base_url}/mpesa/stkpush/v1/processrequest"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {
-        "BusinessShortCode": settings.MPESA_SHORTCODE,
-        "Password": password,
-        "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": amount,
-        "PartyA": formatted_phone,
-        "PartyB": settings.MPESA_SHORTCODE,
-        "PhoneNumber": formatted_phone,
-        "CallBackURL": settings.MPESA_CALLBACK_URL,
-        "AccountReference": f"Order-{body.order_id}" if body.order_id else "NatePoultry",
-        "TransactionDesc": f"Nate Poultry Order {body.order_id}" if body.order_id else "Nate Poultry Payment",
-    }
+    # Build the payload using the helper function
+    payload = _build_stk_payload(
+        formatted_phone=formatted_phone,
+        password=password,
+        timestamp=timestamp,
+        amount=amount,
+        order_id=body.order_id,
+    )
 
     try:
-        async with httpx.AsyncClient() as client:
-            logger.info("Sending STK Push to Safaricom")
-            response = await client.post(url, json=payload, headers=headers, timeout=15.0)
+        # Send STK push using the helper function
+        data = await _send_stk_push(token, payload)
 
-            if response.status_code != 200:
-                logger.error("Safaricom STK Push HTTP error: %s", response.status_code)
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"Safaricom STK Push failed: {response.status_code}",
-                )
+        response_code = data.get("ResponseCode")
+        checkout_request_id = data.get("CheckoutRequestID")
+        merchant_request_id = data.get("MerchantRequestID")
 
-            data = response.json()
-            response_code = data.get("ResponseCode")
-            checkout_request_id = data.get("CheckoutRequestID")
-            merchant_request_id = data.get("MerchantRequestID")
-
-            if response_code != "0" or not checkout_request_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=data.get("ResponseDescription", "Safaricom rejected the STK request."),
-                )
-
-            # Record payment in DB (status=pending until callback confirms)
-            payment = Payment(
-                order_id=body.order_id,
-                phone=formatted_phone,
-                amount=body.amount,
-                checkout_request_id=checkout_request_id,
-                merchant_request_id=merchant_request_id,
-                status="pending",
+        if response_code != "0" or not checkout_request_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=data.get("ResponseDescription", "Safaricom rejected the STK request."),
             )
-            db.add(payment)
-            await db.commit()
 
-            return STKPushResponse(checkout_request_id=checkout_request_id)
+        # Record payment in DB using the helper function
+        await _record_payment(
+            db=db,
+            order_id=body.order_id,
+            phone=formatted_phone,
+            amount=body.amount,
+            checkout_request_id=checkout_request_id,
+            merchant_request_id=merchant_request_id,
+        )
+
+        return STKPushResponse(checkout_request_id=checkout_request_id)
 
     except httpx.RequestError:
         logger.error("Network error contacting Safaricom STK Push API")
@@ -316,13 +382,13 @@ async def mpesa_callback(request: Request, db: AsyncSession = Depends(get_db)):
         # Fulfil ONLY on explicit ResultCode 0 from Safaricom
         if result_code == 0:
             payment.status = "completed"
-            logger.info("Payment completed for order_id=%s", payment.order_id)
+            logger.info("Payment completed for order_id=%s", _sanitize_log(payment.order_id))
             if payment.order_id:
                 await _update_order_status(db, payment.order_id, "paid")
         else:
             # Cancelled, timeout, insufficient funds, wrong PIN, etc.
             payment.status = "failed"
-            logger.info("Payment failed/cancelled (ResultCode=%s) for order_id=%s", result_code, payment.order_id)
+            logger.info("Payment failed/cancelled (ResultCode=%s) for order_id=%s", _sanitize_log(result_code), _sanitize_log(payment.order_id))
             if payment.order_id:
                 await _update_order_status(db, payment.order_id, "failed")
 
@@ -370,6 +436,7 @@ async def _query_safaricom_status(db: AsyncSession, payment: Payment) -> None:
 @router.get("/status/{checkout_request_id}")
 async def check_payment_status(
     checkout_request_id: str,
+    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Return payment status."""

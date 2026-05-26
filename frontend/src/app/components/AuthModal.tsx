@@ -121,10 +121,10 @@ export default function AuthModal({ onClose, onSuccess }: AuthModalProps) {
   };
 
   const handleLogin = async (pinVal?: string) => {
-    const p = pinVal || pin;
+    const p = (pinVal || pin).replace(/[\r\n]/g, '');
     if (p.length !== 4) return;
     setError(''); setLoading(true);
-    const sanitizedPhone = phone.replace(/[^\d+]/g, '');
+    const sanitizedPhone = phone.replace(/[^\d+]/g, '').replace(/[\r\n]/g, '');
     try {
       const res = await loginWithPin(sanitizedPhone, p);
       onSuccess(res.user);
@@ -169,7 +169,7 @@ export default function AuthModal({ onClose, onSuccess }: AuthModalProps) {
             <div style={{ backgroundColor: '#f5f5f5', padding: '14px 12px', borderRight: '2px solid #ddd', color: '#555', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
               🇰🇪 +254
             </div>
-            <input ref={phoneRef} type="tel" inputMode="numeric" placeholder="7XX XXX XXX"
+            <input ref={phoneRef} type="tel" inputMode="numeric" placeholder="7XX XXX XXX or 1XX XXX XXX"
               value={phone.replace(/^\+?254/, '').replace(/^0/, '')}
               onChange={e => { const v = e.target.value.replace(/\D/g, ''); setPhone(v ? `+254${v}` : ''); }}
               onKeyDown={e => e.key === 'Enter' && handleContinue()}

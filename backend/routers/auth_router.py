@@ -1,4 +1,5 @@
 import re
+import html
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
@@ -33,20 +34,30 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 def normalize_phone(raw: str) -> str:
     """Normalize a Kenyan phone number to +254XXXXXXXXX format."""
-    digits = re.sub(r"\D", "", raw)
-    # Handle various formats: 0712..., 254712..., +254712...
+    # Escape input to prevent XSS (CWE-79) before any processing
+    safe_raw = html.escape(raw or "")
+    digits = re.sub(r"\D", "", safe_raw)
+    
+    # Handle various formats: 0712..., 0112..., 254712..., 254112...
     if digits.startswith("0") and len(digits) == 10:
         digits = "254" + digits[1:]
     elif digits.startswith("254") and len(digits) == 12:
         pass  # already correct
     elif digits.startswith("7") and len(digits) == 9:
         digits = "254" + digits
-    elif len(digits) == 12 and digits.startswith("254"):
-        pass
+    elif digits.startswith("1") and len(digits) == 9:
+        digits = "254" + digits
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid phone number format. Use 07XX XXX XXX",
+            detail="Invalid phone number format. Use 07XX XXX XXX or 01XX XXX XXX",
+        )
+    
+    # digits is guaranteed to be only digits due to \D regex, but explicitly check
+    if not digits.isdigit():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid characters in phone number",
         )
     return f"+{digits}"
 
@@ -57,8 +68,8 @@ async def check_phone(body: CheckPhoneRequest, db: AsyncSession = Depends(get_db
     result = await db.execute(select(User).where(User.phone == phone))
     user = result.scalar_one_or_none()
     if user:
-        return CheckPhoneResponse(exists=True, phone=phone, name=user.name)
-    return CheckPhoneResponse(exists=False, phone=phone, name=None)
+        return CheckPhoneResponse(exists=True, phone=user.phone, name=user.name)
+    return CheckPhoneResponse(exists=False, phone="", name=None)
 
 
 @router.post("/create-account", response_model=AuthResponse)
