@@ -103,6 +103,10 @@ _SAFARICOM_PHONE_RE = re.compile(r"^254(7\d{8}|1\d{8})$")
 def format_phone_number(phone: str) -> str:
     """Normalise then strictly validate a Safaricom phone number."""
     cleaned = "".join(c for c in phone if c.isdigit())
+    # Strip leading 0 after country code if present (e.g. 2540712345678 -> 254712345678)
+    if cleaned.startswith("2540") and len(cleaned) == 13:
+        cleaned = "254" + cleaned[4:]
+        
     if cleaned.startswith("0") and len(cleaned) == 10:
         cleaned = "254" + cleaned[1:]
     elif cleaned.startswith("7") and len(cleaned) == 9:

@@ -38,6 +38,10 @@ def normalize_phone(raw: str) -> str:
     safe_raw = html.escape(raw or "")
     digits = re.sub(r"\D", "", safe_raw)
     
+    # Strip leading 0 after country code if present (e.g. 2540712345678 -> 254712345678)
+    if digits.startswith("2540") and len(digits) == 13:
+        digits = "254" + digits[4:]
+    
     # Handle various formats: 0712..., 0112..., 254712..., 254112...
     if digits.startswith("0") and len(digits) == 10:
         digits = "254" + digits[1:]
