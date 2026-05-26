@@ -124,7 +124,7 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/forgot-pin", response_model=ForgotPinResponse)
-async def forgot_pin(_phone: str = Query(...)):
+async def forgot_pin():
     return ForgotPinResponse(
         wa_link=f"https://wa.me/{settings.WHATSAPP_NUMBER}?text=Hi%2C%20I%20forgot%20my%20PIN.%20Please%20help%20me%20reset%20it."
     )

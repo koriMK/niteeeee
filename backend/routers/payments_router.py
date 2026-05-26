@@ -182,7 +182,7 @@ async def initiate_stk_push(
 
     try:
         async with httpx.AsyncClient() as client:
-            logger.info("Sending STK Push to Safaricom for order_id=%s", body.order_id)
+            logger.info("Sending STK Push to Safaricom")
             response = await client.post(url, json=payload, headers=headers, timeout=15.0)
 
             if response.status_code != 200:
@@ -272,7 +272,7 @@ async def mpesa_callback(request: Request, db: AsyncSession = Depends(get_db)):
         if forwarded:
             client_ip = forwarded.split(",")[0].strip()
         if client_ip not in SAFARICOM_IPS:
-            logger.warning("Callback rejected from unauthorised IP: %s", client_ip)
+            logger.warning("Callback rejected from unauthorised IP")
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
     try:

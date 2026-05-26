@@ -124,10 +124,11 @@ export default function AuthModal({ onClose, onSuccess }: AuthModalProps) {
     const p = pinVal || pin;
     if (p.length !== 4) return;
     setError(''); setLoading(true);
+    const sanitizedPhone = phone.replace(/[^\d+]/g, '');
     try {
-      const res = await loginWithPin(phone, p);
+      const res = await loginWithPin(sanitizedPhone, p);
       onSuccess(res.user);
-    } catch (e: unknown) {
+    } catch {
       setError('Invalid PIN or account not found.');
       shake_(); setPin('');
     } finally { setLoading(false); }
