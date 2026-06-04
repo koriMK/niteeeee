@@ -9,23 +9,16 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     WHATSAPP_NUMBER: str = "254792125943"
 
-    MPESA_CONSUMER_KEY: str = ""
-    MPESA_CONSUMER_SECRET: str = ""
-    MPESA_PASSKEY: str = ""
-    MPESA_SHORTCODE: str = ""
-    MPESA_CALLBACK_URL: str = ""
-    # "sandbox" or "production"
-    MPESA_ENV: str = "sandbox"
+    TUMA_BASE_URL: str = "https://api.tuma.co.ke"
+    TUMA_EMAIL: str = ""
+    TUMA_API_KEY: str = ""
+    TUMA_CALLBACK_URL: str = ""
 
-    @property
-    def mpesa_base_url(self) -> str:
-        if self.MPESA_ENV == "production":
-            return "https://api.safaricom.co.ke"
-        return "https://sandbox.safaricom.co.ke"
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = {
+        "extra": "ignore",
+        "env_file": ".env",
+        "env_file_encoding": "utf-8",
+    }
 
 
 settings = Settings()

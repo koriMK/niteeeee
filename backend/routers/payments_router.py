@@ -1,7 +1,24 @@
+"""
+payments_router.py
+──────────────────
+Tuma REST API payment integration for Nate Poultry Meat.
+All Safaricom Daraja / M-Pesa code has been removed.
+
+Authentication flow:
+  POST https://api.tuma.co.ke/auth/token
+  body: { email, api_key }
+  → returns { success, data: { token, ... } }
+
+STK Push flow:
+  POST https://api.tuma.co.ke/payment/stk-push
+  headers: { Authorization: Bearer <token> }
+  body: { amount, phone, callback_url, description }
+  → returns { success, data: { checkout_request_id, merchant_request_id, ... } }
+"""
+
 import re
 import time
-import base64
-from datetime import datetime, timezone, timedelta
+import uuid
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -17,206 +34,125 @@ from database import get_db
 from models import Order, Payment, User
 from schemas import STKPushRequest, STKPushResponse
 
-# Setup logging — intentionally keep payloads OUT of log messages
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-def _sanitize_log(msg: any) -> str:
-    """Sanitize dynamic parameters to prevent log injection (CWE-117)."""
-    return str(msg).replace("\r", "").replace("\n", "")
-
-
 router = APIRouter(prefix="/api/payments", tags=["payments"])
-
 limiter = Limiter(key_func=get_remote_address)
 
-# ── Safaricom production IP allowlist ─────────────────────────────────────────
-# Source: https://developer.safaricom.co.ke/Documentation
-# These are the IPs Safaricom uses to POST callbacks in production.
-# In sandbox, callbacks come from various IPs, so we skip the check there.
-SAFARICOM_IPS = {
-    "196.201.214.200", "196.201.214.206", "196.201.213.114",
-    "196.201.214.207", "196.201.214.208", "196.201.213.44",
-    "196.201.212.127", "196.201.212.138", "196.201.212.129",
-    "196.201.212.136", "196.201.212.74",  "196.201.212.69",
-}
-
-# ── In-memory OAuth token cache ───────────────────────────────────────────────
+# ── Token cache ───────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "expires_at": 0.0}
 
 
-async def get_mpesa_access_token() -> str:
+async def get_tuma_token() -> str:
     """
-    Return a cached Safaricom OAuth token, refreshing it only when near expiry.
-    Token lifetime is 3600 s; we refresh 60 s early for safety.
-    The token is NEVER returned to the browser.
+    Authenticate with the Tuma API and return a cached Bearer token.
+    Token is refreshed automatically when near expiry.
+    Credentials are read from environment variables — never hardcoded.
     """
     now = time.monotonic()
     if _token_cache["token"] and now < _token_cache["expires_at"]:
         return _token_cache["token"]
 
-    if not settings.MPESA_CONSUMER_KEY or not settings.MPESA_CONSUMER_SECRET:
+    if not settings.TUMA_EMAIL or not settings.TUMA_API_KEY:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="M-Pesa credentials not configured.",
+            detail="Tuma credentials (TUMA_EMAIL / TUMA_API_KEY) are not configured.",
         )
 
-    token_url = f"{settings.mpesa_base_url}/oauth/v1/generate"
-    async with httpx.AsyncClient() as client:
-        try:
-            response = await client.get(
-                token_url,
-                params={"grant_type": "client_credentials"},
-                auth=httpx.BasicAuth(settings.MPESA_CONSUMER_KEY, settings.MPESA_CONSUMER_SECRET),
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{settings.TUMA_BASE_URL.rstrip('/')}/auth/token",
+                json={"email": settings.TUMA_EMAIL, "api_key": settings.TUMA_API_KEY},
                 timeout=10.0,
             )
-        except httpx.RequestError:
-            logger.error("HTTP request to Safaricom OAuth failed")
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail="Timeout connecting to Safaricom OAuth API.",
-            )
+    except httpx.RequestError:
+        logger.error("Network error reaching Tuma auth endpoint")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Could not connect to Tuma authentication service.",
+        )
 
-        if response.status_code != 200:
-            logger.error("Failed to generate M-Pesa token (status %s)", response.status_code)
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Safaricom OAuth error. Check credentials.",
-            )
+    if response.status_code == 401:
+        logger.error("Tuma auth rejected — invalid or expired API key")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Tuma authentication failed. Check TUMA_API_KEY.",
+        )
 
-        data = response.json()
-        token = data["access_token"]
-        # Safaricom tokens expire in 3600 s; cache for 3540 s (60-s safety margin)
-        expires_in = int(data.get("expires_in", 3600))
-        _token_cache["token"] = token
-        _token_cache["expires_at"] = now + expires_in - 60
+    if response.status_code != 200:
+        logger.error("Tuma auth returned unexpected status")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Tuma authentication service error.",
+        )
 
+    data = response.json()
+    if not data.get("success"):
+        logger.error("Tuma auth success=false")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=data.get("message", "Tuma authentication failed."),
+        )
+
+    token = data.get("data", {}).get("token")
+    if not token:
+        logger.error("Tuma auth response missing token")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Tuma auth response did not include a token.",
+        )
+
+    expires_in = int(data.get("data", {}).get("expires_in", 3600))
+    _token_cache["token"] = token
+    _token_cache["expires_at"] = now + expires_in - 60  # refresh 60s early
     return token
 
 
 # ── Phone validation ──────────────────────────────────────────────────────────
-# Safaricom Kenya mobile numbers: 2547XXXXXXXX or 2541XXXXXXXX (12 digits)
-_SAFARICOM_PHONE_RE = re.compile(r"^254(7\d{8}|1\d{8})$")
+_PHONE_RE = re.compile(r"^254(7\d{8}|1\d{8})$")
 
 
-def format_phone_number(phone: str) -> str:
-    """Normalise then strictly validate a Safaricom phone number."""
-    cleaned = "".join(c for c in phone if c.isdigit())
-    # Strip leading 0 after country code if present (e.g. 2540712345678 -> 254712345678)
-    if cleaned.startswith("2540") and len(cleaned) == 13:
-        cleaned = "254" + cleaned[4:]
-        
-    if cleaned.startswith("0") and len(cleaned) == 10:
-        cleaned = "254" + cleaned[1:]
-    elif cleaned.startswith("7") and len(cleaned) == 9:
-        cleaned = "254" + cleaned
-    elif cleaned.startswith("1") and len(cleaned) == 9:
-        cleaned = "254" + cleaned
-    return cleaned
-
-
-def _assert_valid_safaricom_number(phone: str) -> None:
-    """Raise HTTP 400 if phone is not a valid Safaricom mobile number."""
-    if not _SAFARICOM_PHONE_RE.match(phone):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid M-Pesa phone number. Must be a Safaricom mobile number "
-                   "(07XXXXXXXX, 01XXXXXXXX, or 2547XXXXXXXX / 2541XXXXXXXX).",
-        )
-
-
-async def _verify_order_for_user(db: AsyncSession, order_id: int, user_id: int) -> Order:
-    """Verify that the order belongs to the user and is in a payable state."""
-    order_res = await db.execute(
-        select(Order).where(Order.id == order_id, Order.user_id == user_id)
+def normalize_phone(phone: str) -> str:
+    """Normalize a Kenyan phone number to 254XXXXXXXXX format."""
+    digits = "".join(c for c in phone if c.isdigit())
+    if digits.startswith("0") and len(digits) == 10:
+        return "254" + digits[1:]
+    if (digits.startswith("7") or digits.startswith("1")) and len(digits) == 9:
+        return "254" + digits
+    if digits.startswith("254") and len(digits) == 12:
+        return digits
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid phone number. Use format: 07XXXXXXXX or 254XXXXXXXXX",
     )
-    order = order_res.scalar_one_or_none()
-    if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Order not found or does not belong to you.",
-        )
-    if order.status not in ("pending",):
+
+
+def _validate_phone(phone: str) -> None:
+    if not _PHONE_RE.match(phone):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Order is no longer in a payable state.",
+            detail="Phone number must be a valid Kenyan mobile number (2547XXXXXXXX or 2541XXXXXXXX).",
         )
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _verify_order(db: AsyncSession, order_id: int, user_id: int) -> Order:
+    res = await db.execute(select(Order).where(Order.id == order_id, Order.user_id == user_id))
+    order = res.scalar_one_or_none()
+    if not order:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Order not found.")
+    if order.status != "pending":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Order is not payable.")
     return order
 
 
-def _generate_mpesa_password(timestamp: str) -> str:
-    """Generate Safaricom M-Pesa password: Base64(Shortcode + Passkey + Timestamp)."""
-    raw_str = f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}"
-    return base64.b64encode(raw_str.encode("utf-8")).decode("utf-8")
-
-
-async def _record_payment(
-    db: AsyncSession,
-    order_id: int | None,
-    phone: str,
-    amount: float,
-    checkout_request_id: str,
-    merchant_request_id: str,
-) -> Payment:
-    """Record payment in DB with status=pending."""
-    payment = Payment(
-        order_id=order_id,
-        phone=phone,
-        amount=amount,
-        checkout_request_id=checkout_request_id,
-        merchant_request_id=merchant_request_id,
-        status="pending",
-    )
-    db.add(payment)
-    await db.commit()
-    return payment
-
-
-def _build_stk_payload(
-    formatted_phone: str, password: str, timestamp: str, amount: int, order_id: int | None
-) -> dict:
-    return {
-        "BusinessShortCode": settings.MPESA_SHORTCODE,
-        "Password": password,
-        "Timestamp": timestamp,
-        "TransactionType": "CustomerPayBillOnline",
-        "Amount": amount,
-        "PartyA": formatted_phone,
-        "PartyB": settings.MPESA_SHORTCODE,
-        "PhoneNumber": formatted_phone,
-        "CallBackURL": settings.MPESA_CALLBACK_URL,
-        "AccountReference": f"Order-{order_id}" if order_id else "NatePoultry",
-        "TransactionDesc": f"Nate Poultry Order {order_id}" if order_id else "Nate Poultry Payment",
-    }
-
-
-async def _send_stk_push(token: str, payload: dict) -> dict:
-    url = f"{settings.mpesa_base_url}/mpesa/stkpush/v1/processrequest"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    logger.info("Sending STK Push to Safaricom")
-    async with httpx.AsyncClient() as client:
-        response = await client.post(url, json=payload, headers=headers, timeout=15.0)
-    if response.status_code != 200:
-        logger.error("Safaricom STK Push HTTP error")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Safaricom STK Push failed: {response.status_code}",
-        )
-    return response.json()
-
-
-def _check_safaricom_ip(request: Request) -> None:
-    """Raise 403 if request does not come from a known Safaricom IP (production only)."""
-    if settings.MPESA_ENV != "production":
-        return
-    client_ip = request.client.host if request.client else ""
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        client_ip = forwarded.split(",")[0].strip()
-    if client_ip not in SAFARICOM_IPS:
-        logger.warning("Callback rejected from unauthorised IP")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+async def _update_order_status(db: AsyncSession, order_id: int, new_status: str) -> None:
+    res = await db.execute(select(Order).where(Order.id == order_id))
+    order = res.scalar_one_or_none()
+    if order:
+        order.status = new_status
 
 
 # ── STK Push ──────────────────────────────────────────────────────────────────
@@ -229,243 +165,172 @@ async def initiate_stk_push(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Initiate a Safaricom M-Pesa Lipa Na M-Pesa Online (STK Push) transaction.
-    Rate-limited to 3 pushes per minute per IP.
-    """
-    # Validate and normalise phone number
-    formatted_phone = format_phone_number(body.phone)
-    _assert_valid_safaricom_number(formatted_phone)
+    """Initiate a Tuma STK Push payment request."""
+    phone = normalize_phone(body.phone)
+    _validate_phone(phone)
 
-    # Verify the order belongs to the authenticated user
     if body.order_id is not None:
-        await _verify_order_for_user(db, body.order_id, user.id)
+        await _verify_order(db, body.order_id, user.id)
 
-    token = await get_mpesa_access_token()
+    token = await get_tuma_token()
+    amount = max(1, round(body.amount))
+    local_ref = uuid.uuid4().hex
 
-    # Generate timestamp in EAT (UTC+3)
-    nairobi_time = datetime.now(timezone(timedelta(hours=3)))
-    timestamp = nairobi_time.strftime("%Y%m%d%H%M%S")
-
-    # Generate password
-    password = _generate_mpesa_password(timestamp)
-
-    amount = max(1, int(round(body.amount)))
-
-    # Build the payload using the helper function
-    payload = _build_stk_payload(
-        formatted_phone=formatted_phone,
-        password=password,
-        timestamp=timestamp,
-        amount=amount,
-        order_id=body.order_id,
-    )
+    callback_url = f"{settings.TUMA_CALLBACK_URL.rstrip('/')}?ref={local_ref}"
 
     try:
-        # Send STK push using the helper function
-        data = await _send_stk_push(token, payload)
-
-        response_code = data.get("ResponseCode")
-        checkout_request_id = data.get("CheckoutRequestID")
-        merchant_request_id = data.get("MerchantRequestID")
-
-        if response_code != "0" or not checkout_request_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=data.get("ResponseDescription", "Safaricom rejected the STK request."),
+        async with httpx.AsyncClient() as client:
+            logger.info("Initiating Tuma STK Push")
+            response = await client.post(
+                f"{settings.TUMA_BASE_URL.rstrip('/')}/payment/stk-push",
+                json={
+                    "amount": amount,
+                    "phone": phone,
+                    "callback_url": callback_url,
+                    "description": (
+                        f"Payment for Order #{body.order_id}"
+                        if body.order_id is not None
+                        else "Nate Poultry Meat payment"
+                    ),
+                },
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                timeout=15.0,
             )
-
-        # Record payment in DB using the helper function
-        await _record_payment(
-            db=db,
-            order_id=body.order_id,
-            phone=formatted_phone,
-            amount=body.amount,
-            checkout_request_id=checkout_request_id,
-            merchant_request_id=merchant_request_id,
-        )
-
-        return STKPushResponse(checkout_request_id=checkout_request_id)
-
     except httpx.RequestError:
-        logger.error("Network error contacting Safaricom STK Push API")
+        logger.error("Network error contacting Tuma STK Push API")
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Timeout or network issue connecting to Safaricom STK Push API.",
+            detail="Could not connect to Tuma payment service.",
         )
 
+    if response.status_code == 401:
+        # Token expired mid-request — clear cache and tell client to retry
+        _token_cache["token"] = None
+        logger.error("Tuma STK Push returned 401 — token expired")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Payment token expired. Please try again.",
+        )
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+    if response.status_code != 200:
+        logger.error("Tuma STK Push returned non-200 status")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Tuma payment service error. Please try again.",
+        )
 
-async def _update_order_status(db: AsyncSession, order_id: int, status_val: str) -> None:
-    order_res = await db.execute(select(Order).where(Order.id == order_id))
-    order = order_res.scalar_one_or_none()
-    if order:
-        order.status = status_val
+    data = response.json()
+    if not data.get("success"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=data.get("message", "Payment request rejected."),
+        )
+
+    resp_data = data.get("data", {})
+    checkout_request_id = resp_data.get("checkout_request_id")
+    merchant_request_id = resp_data.get("merchant_request_id")
+
+    if not checkout_request_id:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Tuma response missing checkout_request_id.",
+        )
+
+    payment = Payment(
+        order_id=body.order_id,
+        phone=phone,
+        amount=amount,
+        checkout_request_id=checkout_request_id,
+        merchant_request_id=str(merchant_request_id) if merchant_request_id else local_ref,
+        status="pending",
+    )
+    db.add(payment)
+    await db.commit()
+
+    return STKPushResponse(checkout_request_id=checkout_request_id)
 
 
-async def _resolve_query_response(db: AsyncSession, payment: Payment, data: dict) -> None:
-    result_code = data.get("ResultCode")
-    response_code = data.get("ResponseCode")
-    if response_code == "0" and result_code is not None:
-        if int(result_code) == 0:
-            payment.status = "completed"
-            if payment.order_id:
-                await _update_order_status(db, payment.order_id, "paid")
-        else:
-            payment.status = "failed"
-            if payment.order_id:
-                await _update_order_status(db, payment.order_id, "failed")
-        await db.commit()
-        await db.refresh(payment)
-
-
-# ── Callback endpoint ─────────────────────────────────────────────────────────
+# ── Callback ──────────────────────────────────────────────────────────────────
 
 @router.post("/callback")
-async def mpesa_callback(request: Request, db: AsyncSession = Depends(get_db)):
-    """
-    Safaricom webhook called when user completes or cancels the transaction.
-
-    Security measures:
-    - Production: IP allowlist enforced (Safaricom known IPs only).
-    - Idempotency: a payment already in a terminal state is ignored.
-    - Order fulfillment ONLY happens on ResultCode == 0 from Safaricom.
-    - Both CheckoutRequestID and MerchantRequestID are cross-checked.
-    - Exceptions return ResultCode=1 so Safaricom will retry.
-    """
-    # IP allowlist in production
-    if settings.MPESA_ENV == "production":
-        client_ip = request.client.host if request.client else ""
-        # Respect X-Forwarded-For from trusted reverse proxy
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            client_ip = forwarded.split(",")[0].strip()
-        if client_ip not in SAFARICOM_IPS:
-            logger.warning("Callback rejected from unauthorised IP")
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-
+async def tuma_callback(request: Request, db: AsyncSession = Depends(get_db)):
+    """Tuma webhook — called when a payment succeeds or fails."""
     try:
         payload = await request.json()
-        # Do NOT log the raw payload — it contains PII (phone numbers, amounts)
-        logger.info("M-Pesa callback received")
+        logger.info("Tuma callback received")
 
-        stk_callback = payload.get("Body", {}).get("stkCallback", {})
-        checkout_request_id = stk_callback.get("CheckoutRequestID")
-        merchant_request_id = stk_callback.get("MerchantRequestID")
-        result_code = stk_callback.get("ResultCode")
+        # Tuma sends checkout_request_id in query params or body
+        checkout_request_id = (
+            request.query_params.get("ref")
+            or payload.get("checkout_request_id")
+            or payload.get("reference")
+        )
+        success = payload.get("success") is True
+        status_value = str(payload.get("status", "")).lower()
+        result_code = payload.get("result_code")
+
+        if result_code is not None:
+            try:
+                success = int(result_code) == 0
+            except (TypeError, ValueError):
+                pass
+
+        if status_value == "completed":
+            success = True
+        elif status_value in ("failed", "cancelled"):
+            success = False
 
         if not checkout_request_id:
-            logger.warning("Callback missing CheckoutRequestID — ignoring")
-            return {"ResultCode": 0, "ResultDesc": "Accepted"}
+            logger.warning("Tuma callback missing checkout_request_id")
+            return {"success": True, "message": "Ignored"}
 
-        # Look up the payment record
-        result = await db.execute(
+        res = await db.execute(
             select(Payment).where(Payment.checkout_request_id == checkout_request_id)
         )
-        payment = result.scalar_one_or_none()
+        payment = res.scalar_one_or_none()
 
         if not payment:
-            logger.warning("Callback for unknown CheckoutRequestID — ignoring")
-            return {"ResultCode": 0, "ResultDesc": "Accepted"}
+            logger.warning("Tuma callback for unknown payment")
+            return {"success": True, "message": "Ignored"}
 
-        # Replay-attack guard: cross-check MerchantRequestID
-        if (
-            merchant_request_id
-            and payment.merchant_request_id
-            and payment.merchant_request_id != merchant_request_id
-        ):
-            logger.warning("MerchantRequestID mismatch — possible replay attack, rejecting")
-            return {"ResultCode": 0, "ResultDesc": "Accepted"}
-
-        # Idempotency: skip if already in a terminal state
+        # Idempotency — skip already-resolved payments
         if payment.status != "pending":
-            logger.info("Duplicate callback for already-processed payment — skipping")
-            return {"ResultCode": 0, "ResultDesc": "Already processed"}
+            return {"success": True, "message": "Already processed"}
 
-        # Fulfil ONLY on explicit ResultCode 0 from Safaricom
-        if result_code == 0:
+        if success:
             payment.status = "completed"
-            logger.info("Payment completed for order_id=%s", _sanitize_log(payment.order_id))
+            logger.info("Payment completed")
             if payment.order_id:
                 await _update_order_status(db, payment.order_id, "paid")
         else:
-            # Cancelled, timeout, insufficient funds, wrong PIN, etc.
             payment.status = "failed"
-            logger.info("Payment failed/cancelled (ResultCode=%s) for order_id=%s", _sanitize_log(result_code), _sanitize_log(payment.order_id))
+            logger.info("Payment failed or cancelled")
             if payment.order_id:
                 await _update_order_status(db, payment.order_id, "failed")
 
         await db.commit()
-        return {"ResultCode": 0, "ResultDesc": "Success"}
+        return {"success": True, "message": "Processed"}
 
     except Exception:
-        # Return ResultCode=1 so Safaricom retries — do NOT silently fulfil orders on error
-        logger.exception("Unhandled error in M-Pesa callback handler")
-        return {"ResultCode": 1, "ResultDesc": "Internal error, please retry"}
+        logger.exception("Unhandled error in Tuma callback")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Internal error.")
 
 
-# ── Payment status (authenticated) ────────────────────────────────────────────
-
-async def _query_safaricom_status(db: AsyncSession, payment: Payment) -> None:
-    """Query Safaricom stkpushquery and update payment status if resolved."""
-    token = await get_mpesa_access_token()
-    nairobi_time = datetime.now(timezone(timedelta(hours=3)))
-    timestamp = nairobi_time.strftime("%Y%m%d%H%M%S")
-    password = base64.b64encode(
-        f"{settings.MPESA_SHORTCODE}{settings.MPESA_PASSKEY}{timestamp}".encode()
-    ).decode()
-
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{settings.mpesa_base_url}/mpesa/stkpushquery/v1/query",
-            json={
-                "BusinessShortCode": settings.MPESA_SHORTCODE,
-                "Password": password,
-                "Timestamp": timestamp,
-                "CheckoutRequestID": payment.checkout_request_id,
-            },
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            timeout=10.0,
-        )
-        if response.status_code == 200:
-            logger.info("STK query response received from Safaricom")
-            await _resolve_query_response(db, payment, response.json())
-        elif response.status_code in (404, 500):
-            logger.info("STK query: transaction still processing")
-        else:
-            logger.warning("Unexpected STK query status code: %s", response.status_code)
-
+# ── Status polling ────────────────────────────────────────────────────────────
 
 @router.get("/status/{checkout_request_id}")
 async def check_payment_status(
     checkout_request_id: str,
-    user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return payment status."""
-    result = await db.execute(
+    """Poll payment status by checkout_request_id."""
+    res = await db.execute(
         select(Payment).where(Payment.checkout_request_id == checkout_request_id)
     )
-    payment = result.scalar_one_or_none()
+    payment = res.scalar_one_or_none()
 
     if not payment:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Payment not found.")
-
-    # Ownership check: only the user who placed the order can poll its status
-    if payment.order_id is not None:
-        order_res = await db.execute(
-            select(Order).where(Order.id == payment.order_id, Order.user_id == user.id)
-        )
-        if order_res.scalar_one_or_none() is None:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
-
-    if payment.status == "pending":
-        try:
-            await _query_safaricom_status(db, payment)
-            await db.refresh(payment)
-        except Exception:
-            logger.error("Error querying Safaricom for payment status")
 
     return {
         "checkout_request_id": payment.checkout_request_id,
